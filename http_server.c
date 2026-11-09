@@ -15,6 +15,7 @@
 #include <linux/mempool.h>
 #include <linux/hashtable.h>
 #include <linux/jhash.h>
+#include <linux/spinlock.h>
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 17, 0)
 #define kthread_complete_and_exit(comp, code) complete_and_exit(comp, code)
@@ -27,10 +28,12 @@
 #define PATH_SIZE 256         // 存放檔案路徑 array 大小
 #define CRLF "\r\n"
 
+// http compress
+#define COMPRESS_ALGORITHM "deflate"
+
 // 建立 hash table 
-#define DEFINE_HASHTABLE(ht, 8) // 建立 256(2^8) 個 bucket，以利快速搜尋
-#define DEFINE_SPINLOCK(hash_lock) // 建立 spinlock，避免同時寫入 hash table
-spinlock_t hash_lock;
+DEFINE_HASHTABLE(ht, 8); // 建立 256(2^8) 個 bucket，以利快速搜尋
+spinlock_t hash_lock; // 建立 spinlock，避免同時寫入 hash table
 
 #define HTTP_RESPONSE_200_DUMMY                               \
     ""                                                        \
@@ -475,6 +478,30 @@ static void send_cache(struct socket *socket, struct list_head *cache_list){
 }
 // ===================================================
 
+// ================= compress =========================
+bool compress(const char *input,
+              unsigned int input_len,
+              char *output,
+              unsigned int *output_len)
+{
+    struct crypto_comp *comp;
+
+    comp = crypto_alloc_comp(COMPRESS_ALGORITHM, 0, 0);
+    if(IS_ERR(comp)){
+        pr_err("Failed to allocate compression object\n");
+        return false;
+    }
+    int ret = crypto_comp_compress(comp, input, input_len, output, output_len);
+    if(ret){
+        pr_err("Compression failed with error code: %d\n", ret);
+        crypto_free_comp(comp);
+        return false;
+    }
+
+    crypto_free_comp(comp);
+    return true;
+}
+// ====================================================
 // 回應瀏覽器的請求，產生一 "目錄檔案列表" 的網頁，負責檢查是否為 GET、送
 // header、 送 HTML 開頭和結尾、打開目錄並call iterate_dir 讀取該目錄內容
 static bool handle_directory(struct http_request *request)
@@ -546,14 +573,31 @@ static bool handle_directory(struct http_request *request)
     } else if (
         S_ISREG(fp->f_inode
                     ->i_mode)) {  // 如果是一般文件的話，就回傳檔案資料給client
+        char buf[SEND_BUFFER_SIZE];
         char *read_data = kmalloc(fp->f_inode->i_size, GFP_KERNEL);
+        char *comp_data = NULL;
+        usigned int comp_len = 0;
         int ret = read_file(fp, read_data);
 
-        send_http_header(request->socket, HTTP_STATUS_OK,
-                         http_status_str(HTTP_STATUS_OK), 
-                         get_mime_str(request->request_url),  
-                         ret, "Close");
-        http_server_send(request->socket, read_data, ret);
+        if(!read_data || ret < 0) goto out_free;
+
+        comp_len = ret + 1024;
+        comp_data = kmalloc(comp_len, GFP_KERNEL);
+        if(!comp_data) goto out_free;
+        if(!compress(read_data, ret, comp_data, &comp+len)){ // 壓縮檔案內容
+            goto out_free;
+        }
+        
+        SEND_HTTP_MSG(request->socket, buf,
+                  "HTTP/1.1 200 OK\r\nContent-Encoding: deflate\r\n"
+                  "Content-Type: %s\r\nContent-Length: %u\r\n"
+                  "Connection: Close\r\n\r\n",
+                  get_mime_str(request->request_url), comp_len);
+
+        http_server_send(request->socket, comp_data, comp_len);
+
+    out_free:
+        kfree(comp_data);
         kfree(read_data);
     }
 
