@@ -11,6 +11,10 @@
 #include <linux/tcp.h>
 #include <linux/version.h>
 #include <linux/workqueue.h>
+#include <linux/string.h>
+#include <linux/mempool.h>
+#include <linux/hashtable.h>
+#include <linux/jhash.h>
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 17, 0)
 #define kthread_complete_and_exit(comp, code) complete_and_exit(comp, code)
@@ -22,6 +26,11 @@
 #define SEND_BUFFER_SIZE 256  // 設定傳出去的大小(snprintf)
 #define PATH_SIZE 256         // 存放檔案路徑 array 大小
 #define CRLF "\r\n"
+
+// 建立 hash table 
+#define DEFINE_HASHTABLE(ht, 8) // 建立 256(2^8) 個 bucket，以利快速搜尋
+#define DEFINE_SPINLOCK(hash_lock) // 建立 spinlock，避免同時寫入 hash table
+spinlock_t hash_lock;
 
 #define HTTP_RESPONSE_200_DUMMY                               \
     ""                                                        \
@@ -49,6 +58,41 @@
     snprintf(buf, SEND_BUFFER_SIZE, format, __VA_ARGS__); \
     http_server_send(socket, buf, strlen(buf))
 
+// mime map，資料格式(type:副檔名, mime:對應的MIME type)
+struct mime_type{
+    const char* type;
+    const char* mime;
+};
+
+struct mime_type mime_map[] = {
+    {".html", "text/html"},
+    {".htm", "text/html"},
+    {".css", "text/css"},
+    {".js", "application/javascript"},
+    {".json", "application/json"},
+    {".png", "image/png"},
+    {".jpg", "image/jpeg"},
+    {".jpeg", "image/jpeg"},
+    {".gif", "image/gif"},
+    {".txt", "text/plain"},
+    {NULL, NULL}
+};
+
+/* 把回應都先存起來，之後同樣的 request 進來，
+就照順序把這些片段送給 client，不用重新產生。 */
+struct cache_content{
+    struct list_head cache; // 負責連結各個 response
+    char buf[SEND_BUFFER_SIZE]; // 這個片段要response的內容
+};
+
+// <request url, response>的map
+struct hash_content{
+    struct list_head *head; // value，指向完整 response 內容，例如<tr><td><a href="/a.txt">a.txt</a></td></tr>\r\n
+    char *request; // key: request url
+    struct hlist_node node; // 串連hash table的節點
+    void *timer_node; // 計時器，用來移除過期的節點
+};
+
 // 工作資訊
 struct http_request {
     struct socket *socket;    // 該 work 連線的 socket
@@ -60,6 +104,8 @@ struct http_request {
     // 新增 `串列節點` 與 `work 本體`
     struct list_head node;
     struct work_struct khttpd_work;
+    // directory cache 的 linklist
+    struct list_head *cache_list;
 };
 
 static int http_server_recv(struct socket *sock, char *buf, size_t size)
@@ -100,6 +146,7 @@ static int http_server_send(struct socket *sock, const char *buf, size_t size)
     return done;
 }
 
+// function prototype
 static bool handle_directory(struct http_request *request);
 static bool tracedir(struct dir_context *dir_context,
                      const char *name,
@@ -107,6 +154,8 @@ static bool tracedir(struct dir_context *dir_context,
                      loff_t offset,
                      u64 ino,
                      unsigned int dtype);
+const char* get_mime_str(char* request_url);
+static struct list_head* find_cache(char* url);
 
 // 處理 response
 static int http_server_response(struct http_request *request, int keep_alive)
@@ -316,16 +365,22 @@ static bool tracedir(struct dir_context *dir_context,
                      u64 ino,
                      unsigned int dtype)
 {
-    if (strcmp(name, ".")) {
-        struct http_request *request =
-            container_of(dir_context, struct http_request, dir_context);
-        char buf[SEND_BUFFER_SIZE] = {0};
+    struct http_request *request =
+        container_of(dir_context, struct http_request, dir_context);
 
-        SEND_HTTP_MSG(request->socket, buf,
-                      "%zx\r\n<tr><td><a href=\"%s/%s\">%s</a></td></tr>\r\n",
-                      34 + strlen(request->request_url) + (namelen << 1),
-                      request->request_url, name, name);
+    if(namelen == 1 && name[0] == '.'){
+        return true;
     }
+    
+    struct cache_content *content = kmalloc(sizeof(struct cache_content), GFP_KERNEL);
+    if(!content){
+        pr_err("can't allocate memory for cache content\n");
+        return false;
+    }
+
+    snprintf(content->buf, SEND_BUFFER_SIZE, "%lx\r\n<tr><td><a href=\"%s\">%s</a></td></tr>\r\n", 34 + strlen(href_link) + strlen(name), href_link, name);
+    add_to_list_tail(&content->cache, request->cache_list);         
+
     return true;
 }
 
@@ -363,6 +418,62 @@ static void send_http_content(struct socket *socket, const char *content)
     char buf[SEND_BUFFER_SIZE] = {0};
     SEND_HTTP_MSG(socket, buf, "%s", content);
 }
+// ================== cache content ==================
+/* 確認是否已經看過了，有的話回傳list_head */
+static list_head* find_cache(char* url){
+    u32 original_key = jhash(url, strlen(url), 0);
+    u8 key = (u8)(original_key % 256);
+    struct hash_content *curr;
+    struct list_head *res = NULL;
+
+    rcu_read_lock();
+    hash_for_each_possible_rcu(ht, curr, node, key){
+        if(strcmp(curr -> request, url) == 0){
+            res = curr -> head;
+            break;
+        }
+    }
+    rcu_read_unlock();
+
+    return res;
+}
+
+bool hash_insert(const char* request_url, struct list_head *head){
+    u32 original_key = jhash(request_url, strlen(request_url), 0); // 把 url 變成一段 32bit 的 hash value
+    u8 key = (u8)(original_key % 256);
+    
+    // init hash_content
+    struct hash_content *content = kmalloc(sizeof(struct hash_content), GFP_KERNEL);
+    content -> head = head;
+    content -> request = kmalloc(strlen(request_url) + 1, GFP_KERNEL);
+    memcpy(content -> request, request_url, strlen(request_url) + 1);
+
+    spin_lock(&hash_lock); // 用spinlock避免重複寫入、同時改指標。只要走訪幾個node，所以不太會佔用過多時間，所以選擇spinlock
+    struct hash_content *curr = NULL;
+    hash_for_each_possible_rcu(ht, curr, node, key){
+        char *curr_request_url = curr -> request;
+        if(strcmp(curr_request_url, request_url) == 0){ // 如果已經有這個 url 的 cache content，就不再新增
+            spin_unlock(&hash_lock);
+            kfree(content -> request);
+            kfree(content);
+            return false;
+
+        }
+    }
+    hash_add_rcu(ht, &content -> node, key);
+    spin_unlock(&hash_lock);
+
+    return true;
+}
+
+static void send_cache(struct socket *socket, struct list_head *cache_list){
+    struct cache_content *cache_tmp;
+
+    list_for_each_entry(cache_tmp, cache_list, cache){
+        http_server_send(socket, cache_tmp -> buf, strlen(cache_tmp -> buf));
+    }
+}
+// ===================================================
 
 // 回應瀏覽器的請求，產生一 "目錄檔案列表" 的網頁，負責檢查是否為 GET、送
 // header、 送 HTML 開頭和結尾、打開目錄並call iterate_dir 讀取該目錄內容
@@ -370,6 +481,15 @@ static bool handle_directory(struct http_request *request)
 {
     struct file *fp;
     char pwd[PATH_SIZE] = {0};
+
+    // 檢查是否已經有存在，如果有存在，就直接送出 cache content，並關閉 socket。須於 flip_open 前，才能有效發揮作用
+    struct list_head *curr_cache = find_cache(request -> request_url);
+    if(curr_cache){
+        send_cache(request->socket, curr_cache);
+        kernel_sock_shutdown(request->socket, SHUT_RDWR);
+        filp_close(fp, NULL);
+        return true;
+    }
 
     catstr(pwd, daemon_list.dir_path, request->request_url);
     fp = filp_open(pwd, O_RDONLY, 0);
@@ -381,29 +501,47 @@ static bool handle_directory(struct http_request *request)
         return false;
     }
 
-    if (S_ISDIR(
-            fp->f_inode
-                ->i_mode)) {  // 如果是目錄，將整個目錄下的檔案名稱回傳給client
-        char buf[SEND_BUFFER_SIZE] = {0};
-        char const *head =
+    if (S_ISDIR(fp->f_inode->i_mode)) {  // 如果是目錄，將整個目錄下的檔案名稱回傳給client
+        char const *html_head =
             "<html><head><style>\r\n"
             "body{font-family: monospace; font-size: 15px;}\r\n"
             "td {padding: 1.5px 6px;}\r\n"
             "</style></head><body><table>\r\n";
         char const *body = "</table></body></html>\r\n";
 
-        SEND_HTTP_MSG(
-            request->socket, buf, "%s",
-            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n"
-            "Transfer-Encoding: chunked\r\nConnection: Close\r\n\r\n");
+        // 初始化 cache 串列
+        struct list_head *head = kmalloc(sizeof(struct list_head), GFP_KERNEL); // 配置cache content memory
+        struct cache_content *content_header = kmalloc(sizeof(struct cache_content), GFP_KERNEL);
+        struct cache_content *content_body = kmalloc(sizeof(struct cache_content), GFP_KERNEL);
+        struct cache_content *content_html = kmalloc(sizeof(struct cache_content), GFP_KERNEL);
 
-        SEND_HTTP_MSG(request->socket, buf, "%zx\r\n%s\r\n", strlen(head),
-                      head);
+        INIT_LIST_HEAD(head);
+        request -> cache_list = head;
+
+        // 回傳 header，並把 header 存進 cache content
+        snprintf(content_header->buf, SEND_BUFFER_SIZE, "%s%s%s%s",
+            "HTTP/1.1 200 OK\r\n", "Connection: Keep-Alive\r\n",
+            "Content-Type: text/html\r\n",
+            "Transfer-Encoding: chunked\r\n\r\n");
+        add_to_list_tail(&content_header->cache, request->cache_list);
+        
+        // 回傳 html 開頭，並把 html 開頭存進 cache content
+        snprintf(content_html->buf, SEND_BUFFER_SIZE, "%zx\r\n%s\r\n",
+                strlen(html_head), html_head);
+        add_to_list_tail(&content_html->cache, request->cache_list);
+        
+        // 找個目錄，讀取裡面的檔案名稱，並把檔案名稱包成 <tr>，以 chunked 格式傳送給 client
         iterate_dir(fp, &request->dir_context);
-        SEND_HTTP_MSG(request->socket, buf, "%zx\r\n%s\r\n", strlen(body),
-                      body);
-
-        SEND_HTTP_MSG(request->socket, buf, "%s", "0\r\n\r\n");
+        
+        // 回傳 html 結尾，並把 html 結尾存進 cache content
+        snprintf(content_body->buf, SEND_BUFFER_SIZE, "%zx\r\n%s\r\n0\r\n\r\n",
+                strlen(body), body);
+        add_to_list_tail(&content_body->cache, request->cache_list);
+        
+        send_cache(request->socket, request->cache_list); // 先送
+        if (!hash_insert(request->request_url, request->cache_list)) // 再存
+            free_cache_list(request->cache_list); // 別人已存過，釋放自己這份
+        
         kernel_sock_shutdown(request->socket, SHUT_RDWR);
     } else if (
         S_ISREG(fp->f_inode
@@ -412,8 +550,9 @@ static bool handle_directory(struct http_request *request)
         int ret = read_file(fp, read_data);
 
         send_http_header(request->socket, HTTP_STATUS_OK,
-                         http_status_str(HTTP_STATUS_OK), "text/plain", ret,
-                         "Close");
+                         http_status_str(HTTP_STATUS_OK), 
+                         get_mime_str(request->request_url),  
+                         ret, "Close");
         http_server_send(request->socket, read_data, ret);
         kfree(read_data);
     }
@@ -421,4 +560,19 @@ static bool handle_directory(struct http_request *request)
 
     filp_close(fp, NULL);
     return true;
+}
+
+// MIME
+const char* get_mime_str(char* request_url){
+    char* request_type = strchr(request_url, '.');
+    int index = 0;
+    if(!request_type) return "text/plain";
+
+    while(mime_map[index].type){
+        if(!strcmp(mime_map[index].type, request_type)){
+            return mime_map[index].mime;
+        }
+        index++;
+    }
+    return "text/plain";
 }
