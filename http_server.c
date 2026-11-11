@@ -16,6 +16,9 @@
 #include <linux/hashtable.h>
 #include <linux/jhash.h>
 #include <linux/spinlock.h>
+#include <linux/uio.h>
+#include <linux/atomic.h>
+#include <linux/ktime.h>
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 17, 0)
 #define kthread_complete_and_exit(comp, code) complete_and_exit(comp, code)
@@ -27,6 +30,7 @@
 #define SEND_BUFFER_SIZE 256  // 設定傳出去的大小(snprintf)
 #define PATH_SIZE 256         // 存放檔案路徑 array 大小
 #define CRLF "\r\n"
+#define MAX_KVEC 32  // scatter-gather I/O 的最大 kvec 數量
 
 // http compress
 #define COMPRESS_ALGORITHM "deflate"
@@ -80,6 +84,7 @@ struct mime_type mime_map[] = {
     {".txt", "text/plain"},
     {NULL, NULL}
 };
+// =================================================
 
 /* 把回應都先存起來，之後同樣的 request 進來，
 就照順序把這些片段送給 client，不用重新產生。 */
@@ -95,6 +100,38 @@ struct hash_content{
     struct hlist_node node; // 串連hash table的節點
     void *timer_node; // 計時器，用來移除過期的節點
 };
+// =================================================
+
+// 連線的計時器
+typedef int timer_comp(void *a, void *b)(void *object);
+typedef int ()
+
+typedef struct {
+    size_t key; // expired time
+    size_t pos; // 在heap中的位置
+    timer_callback callback;// 關閉 socket 的 function
+    void *object; // 對應的 http_request
+} timer_node_t;
+
+static int timer_comp(void *a, void *b){
+    timer_node_t *x = (timer_node_t *)a;
+    timer_node_t *y = (timer_node_t *)b;
+    return x->key < y->key;
+} 
+// =================================================
+
+// 管理所有計時器(min heap)
+typedef struct {
+    void **priv; // heap，每格存一個 timer_node_t
+    atomic_t nalloc; // 目前有幾個 timer
+    atomic_t size; // size of queue
+    prio_queue_comparator comp; // key 小的擺前面，這樣才能維持 queue
+    spinlock_t lock;              
+} prio_queue_t;
+
+static atomic_64 current_mes = ATOMIC_64_INIT(0);
+static prio_queue_t timer;
+// =================================================
 
 // 工作資訊
 struct http_request {
@@ -109,6 +146,7 @@ struct http_request {
     struct work_struct khttpd_work;
     // directory cache 的 linklist
     struct list_head *cache_list;
+    timer_node_t *timer_node;
 };
 
 static int http_server_recv(struct socket *sock, char *buf, size_t size)
@@ -329,14 +367,17 @@ int http_server_daemon(void *arg)
     daemon_list.is_stopped = false;
 
     while (!kthread_should_stop()) {
-        int err = kernel_accept(param->listen_socket, &socket, 0);
+        int err = kernel_accept(param->listen_socket, &socket, SOCK_NONBLOCK); // non-blocking
 
         if (err < 0) {
             if (signal_pending(current))
                 break;
             /* -EAGAIN means the accept timeout expired; loop back to reap */
-            if (err != -EAGAIN)
+            if (err == -EAGAIN) continue;
+            else{
                 pr_err("kernel_accept() error: %d\n", err);
+                break;
+            }
             continue;
         }
         /* Accepted sockets inherit the listener's timeout. Restore the
@@ -423,7 +464,7 @@ static void send_http_content(struct socket *socket, const char *content)
 }
 // ================== cache content ==================
 /* 確認是否已經看過了，有的話回傳list_head */
-static list_head* find_cache(char* url){
+static struct list_head* find_cache(char* url){
     u32 original_key = jhash(url, strlen(url), 0);
     u8 key = (u8)(original_key % 256);
     struct hash_content *curr;
@@ -502,8 +543,10 @@ bool compress(const char *input,
     return true;
 }
 // ====================================================
-// 回應瀏覽器的請求，產生一 "目錄檔案列表" 的網頁，負責檢查是否為 GET、送
-// header、 送 HTML 開頭和結尾、打開目錄並call iterate_dir 讀取該目錄內容
+
+
+/* 回應瀏覽器的請求，產生一 "目錄檔案列表" 的網頁，負責檢查是否為 GET、送
+header、 送 HTML 開頭和結尾、打開目錄並call iterate_dir 讀取該目錄內容*/
 static bool handle_directory(struct http_request *request)
 {
     struct file *fp;
@@ -576,7 +619,7 @@ static bool handle_directory(struct http_request *request)
         char buf[SEND_BUFFER_SIZE];
         char *read_data = kmalloc(fp->f_inode->i_size, GFP_KERNEL);
         char *comp_data = NULL;
-        usigned int comp_len = 0;
+        unsigned int comp_len = 0;
         int ret = read_file(fp, read_data);
 
         if(!read_data || ret < 0) goto out_free;
@@ -584,7 +627,7 @@ static bool handle_directory(struct http_request *request)
         comp_len = ret + 1024;
         comp_data = kmalloc(comp_len, GFP_KERNEL);
         if(!comp_data) goto out_free;
-        if(!compress(read_data, ret, comp_data, &comp+len)){ // 壓縮檔案內容
+        if(!compress(read_data, ret, comp_data, &comp_len)){ // 壓縮檔案內容
             goto out_free;
         }
         
@@ -619,4 +662,142 @@ const char* get_mime_str(char* request_url){
         index++;
     }
     return "text/plain";
+}
+
+// ================= scatter-gather I/O =========================
+// 以 kvec 記錄多段 buffer，一次 response 送出，減少複製與系統呼叫 
+void send_all_buffers(struct socket *sock, struct list_head *head){
+    struct cache_content *curr;
+    struct kvec vec[MAX_KVEC]; // 使用指標+長度去描述一段資料
+    int vlen = 0;
+
+    list_for_each_entry(curr, head, cache){
+        if(vlen >= MAX_KVEC){
+            pr_err("Too many buffers to send in one go\n");
+            break;
+        }
+        vec[vlen].iov_base = curr->buf; // 指向要傳送的資料，資料的起點
+        vec[vlen].iov_len = strlen(curr->buf); // 資料長度
+        vlen++;
+    }
+
+    if(vlen > 0){
+        http_server_send2(sock, vec, vlen);
+    }
+}
+// ==============================================================
+
+// ================= scatter-gather I/O =========================
+static void current_time_update(void){
+    atomic64_set(&current_mes, ktime_to_ms(ktime_get()));
+}
+//swap 兩個 timer
+static void swap_timer(prio_queue_t *q, size_t i, size_t j){
+    void *tmp = q->priv[i];
+    q->priv[i] = q->priv[j];
+    q->priv[j] = tmp;
+
+    ((timer_node_t *)q->priv[i])->pos = i;
+    ((timer_node_t *)q->priv[j])->pos = j;
+}
+
+// 將 timer queue 重新排列，讓 key 最小的放在 root
+static void arrange_heap(prio_queue_t *q, size_t k){
+    size_t n = q->nalloc;
+    while(2 * k <= n){
+        size_t left = 2 * k;
+        if(left < n && q->comp(q->priv[left + 1], q->priv[left])) left++;
+        if(!q->comp(q->priv[left], q->priv[k])) break;
+        swap_timer(q, k, left);
+        k = left;
+    }
+}
+
+// 將位置 k 的 node 往上移，直到不比 parent 小
+static void heap_swim(prio_queue_t *q, size_t k){
+    while(k > 1 && q->comp(q->priv[k], q->priv[k/2])){
+        swap_timer(q, k, k/2);
+        k /= 2;
+    }
+}
+
+//
+static bool heap_resize(prio_queue_t *q, size_t k){
+    void **new_priv = krealloc(q->priv, sizeof(void*) * k, GFP_ATOMIC);
+    if(!new_priv) return false;
+
+    q->priv = new_priv;
+    q->size = k;
+    return true;
+}
+
+static void prio_queue_insert(prio_queue_t *timer, timer_node_t *node){
+    size_t n = atomic_read(&timer->nalloc);
+
+    if(n + 1 >= atomic_read(&timer->size)){
+        if(!heap_resize(timer, timer->size*2))
+            return;
+    }
+    n++;
+    timer->priv[n] = node;
+    node->pos = n;
+    atomic_set(&timer->nalloc, n);
+    heap_swim(timer, n);
+}
+
+bool http_add_timer(void *object, size_t timeout, timer_callback cb, bool is_socket){
+    timer_node_t *node = kmalloc(sizeof(timer_node_t), GFP_KERNEL);
+
+    if(!node) return false;
+
+    current_time_update();
+    node->key = atomic64_read(&current_msec) + timeout;
+    node->pos = atomic_read(&timer.nalloc) + 1;
+    node->callback = cb;
+    node->object = object;
+
+    if(is_socket == false){
+        struct hash_content *content = (struct hash_content*) object;
+        content->timer_node = node;
+        pr_info("Added timer for key %s\n", content->request);
+    }
+    else{
+        struct http_request *req = (struct http_request*) object;
+        req->timer_node = node;
+        pr_info("Added timer for socket\n");
+    }
+
+    spin_lock(&timer.lock);
+    prio_queue_insert(&timer, node);
+    spin_unlock(&timer.lock);
+    return true;
+}
+
+// 移除過期的 node
+static void prio_queue_delmin(prio_queue_t *q){
+    if(atomic_read(&q->nalloc) == 0) return;
+    swap_timer(q, 1, atomic_read(q->nalloc));
+    atomic_dec(&q->nalloc);
+    arrange_heap(q, 1);
+}
+
+void handle_expired_timers(void){
+    while(!prio_queue_is_empty(&timer)){
+        timer_node_t *node;
+
+        current_time_update();
+        node = prio_queue_min(&timer);
+
+        if(node->key > atomic64_read(&current_msec)) return;
+        prio_queue_delmin(&timer);
+        kfree(node);
+    }
+}
+
+int shutdown_socket(void *http_req){
+    struct http_request *request = (struct http_request *) http_req;
+    struct socket *socket = request->socket;
+    kernel_sock_shutdown(socket, SHUT_RDWR);
+    request->complete = 1;
+    return 1;
 }
