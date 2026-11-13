@@ -231,6 +231,7 @@ static bool http_add_timer(void *object,
                            bool is_socket);
 static int shutdown_socket(void *http_req);
 static void send_all_buffers(struct socket *sock, struct list_head *head);
+static int remove_key_from_hashtable(void *hash_cnt);
 
 // 處理 response
 static int http_server_response(struct http_request *request, int keep_alive)
@@ -842,7 +843,6 @@ static void heap_swim(prio_queue_t *q, size_t k)
     }
 }
 
-//
 static bool heap_resize(prio_queue_t *q, size_t k)
 {
     void **new_priv = krealloc(q->priv, sizeof(void *) * k, GFP_ATOMIC);
@@ -941,3 +941,56 @@ static int shutdown_socket(void *http_req)
     request->complete = 1;
     return 1;
 }
+
+// ==============================================================
+
+// ================= delete url cache ===========================
+static int remove_key_from_hashtable(void *hash_cnt){
+    struct hash_content *target = (struct hash_content *) hash_cnt;
+    struct hash_content *now = NULL;
+    struct cache_content *cache_entry, *tmp;
+
+    // 找出 key
+    char *request_url = target->request;
+    u32 original_key = jhash(request_url, strlen(request_url), 0);
+    u8 key = (u8)(original_key);
+
+    rcu_read_lock();
+    hash_for_each_possible_rcu(ht, now, node, key){
+        char *curr_request_url = now->request;
+        if(strcmp(request_url, now_request_url) == 0){
+            pr_info("Removing key %s from hash table\n", request_url);
+
+            // delete hash_content from hash table
+            spin_lock(&hash_lock);
+            if(!hash_hashed(&now->node)){
+                spin_unlock(&hash_lock);
+                rcu_read_unlock();
+                pr_info("Key already removed");
+                return 0;
+            }
+            hash_del_rcu(&curr->node);
+            spin_unlock(&hash_lock);
+
+            // 等待所有RCU讀取結束
+            rcu_read_unlock();
+            syschronize_rcu();
+
+            // 釋放 cache list 每個 buffer
+            list_for_each_entry_safe(cache_entry, tmp, now->head, cache){
+                list_del(&cache_entry->cache);
+                kfree(cache_entry);
+            } 
+
+            // release
+            free_cache_list(now->head);
+            pr_info("Key removed");
+            kfree(now->request);
+            kfree(now);
+
+            return 1;
+        }
+    }
+    rcu_read_unlock();
+}
+// ==============================================================
