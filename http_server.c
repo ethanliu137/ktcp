@@ -1,5 +1,7 @@
 //#include <stdio.h>
 //#include <sys/types.h>
+//#include <stdbool.h>
+//#include <stddef.h>
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
 #include <linux/atomic.h>
@@ -31,8 +33,9 @@
 #define SEND_BUFFER_SIZE 256  // 設定傳出去的大小(snprintf)
 #define PATH_SIZE 256         // 存放檔案路徑 array 大小
 #define CRLF "\r\n"
-#define MAX_KVEC 32  // scatter-gather I/O 的最大 kvec 數量
-#define TIMEOUT_MS 5000
+#define MAX_KVEC 32       // scatter-gather I/O 的最大 kvec 數量
+#define TIMEOUT_MS 15000  // 連線後 15sec 未發送資料，會把連線關掉
+#define CACHE_TIMEOUT_MS 60000  // cache 超過60秒未被訪問，就將其清除
 
 // http compress
 #define COMPRESS_ALGORITHM "deflate"
@@ -232,6 +235,7 @@ static bool http_add_timer(void *object,
 static int shutdown_socket(void *http_req);
 static void send_all_buffers(struct socket *sock, struct list_head *head);
 static int remove_key_from_hashtable(void *hash_cnt);
+static void cache_timer_refresh(struct hash_content *content);
 
 // 處理 response
 static int http_server_response(struct http_request *request, int keep_alive)
@@ -541,6 +545,7 @@ static struct list_head *find_cache(char *url)
         // cppcheck-suppress uninitvar
         if (strcmp(curr->request, url) == 0) {
             res = curr->head;
+            cache_timer_refresh(curr);
             break;
         }
     }
@@ -559,6 +564,7 @@ static bool hash_insert(const char *request_url, struct list_head *head)
     struct hash_content *content =
         kmalloc(sizeof(struct hash_content), GFP_KERNEL);
     content->head = head;
+    content->timer_node = NULL;
     content->request = kmalloc(strlen(request_url) + 1, GFP_KERNEL);
     memcpy(content->request, request_url, strlen(request_url) + 1);
 
@@ -579,6 +585,7 @@ static bool hash_insert(const char *request_url, struct list_head *head)
     hash_add_rcu(ht, &content->node, key);
     spin_unlock(&hash_lock);
 
+    http_add_timer(content, CACHE_TIMEOUT_MS, remove_key_from_hashtable, false);
     return true;
 }
 /*
@@ -869,6 +876,24 @@ static void prio_queue_insert(prio_queue_t *timer, timer_node_t *node)
     heap_swim(timer, n);
 }
 
+static void cache_timer_refresh(struct hash_content *content)
+{
+    timer_node_t *node = READ_ONCE(content->timer_node);
+    if (!node)
+        return;
+
+    current_time_update();
+    spin_lock(&timer.lock);
+    size_t pos = node->pos;
+
+    if (pos >= 1 && pos <= atomic_read(&timer.nalloc) &&
+        timer.priv[pos] == node) {
+        node->key = atomic64_read(&current_msec) + CACHE_TIMEOUT_MS;
+        arrange_heap(&timer, pos);
+    }
+    spin_unlock(&timer.lock);
+}
+
 static bool http_add_timer(void *object,
                            size_t timeout,
                            timer_callback cb,
@@ -945,7 +970,8 @@ static int shutdown_socket(void *http_req)
 // ==============================================================
 
 // ================= delete url cache ===========================
-static int remove_key_from_hashtable(void *hash_cnt){
+static int remove_key_from_hashtable(void *hash_cnt)
+{
     struct hash_content *target = (struct hash_content *) hash_cnt;
     struct hash_content *now = NULL;
     struct cache_content *cache_entry, *tmp;
@@ -953,34 +979,35 @@ static int remove_key_from_hashtable(void *hash_cnt){
     // 找出 key
     char *request_url = target->request;
     u32 original_key = jhash(request_url, strlen(request_url), 0);
-    u8 key = (u8)(original_key);
+    u8 key = (u8) (original_key);
 
     rcu_read_lock();
-    hash_for_each_possible_rcu(ht, now, node, key){
-        char *curr_request_url = now->request;
-        if(strcmp(request_url, now_request_url) == 0){
+    hash_for_each_possible_rcu(ht, now, node, key)
+    {
+        char *now_request_url = now->request;
+        if (strcmp(request_url, now_request_url) == 0) {
             pr_info("Removing key %s from hash table\n", request_url);
 
             // delete hash_content from hash table
             spin_lock(&hash_lock);
-            if(!hash_hashed(&now->node)){
+            if (!hash_hashed(&now->node)) {
                 spin_unlock(&hash_lock);
                 rcu_read_unlock();
                 pr_info("Key already removed");
                 return 0;
             }
-            hash_del_rcu(&curr->node);
+            hash_del_rcu(&now->node);
             spin_unlock(&hash_lock);
 
             // 等待所有RCU讀取結束
             rcu_read_unlock();
-            syschronize_rcu();
+            synchronize_rcu();
 
             // 釋放 cache list 每個 buffer
-            list_for_each_entry_safe(cache_entry, tmp, now->head, cache){
+            list_for_each_entry_safe (cache_entry, tmp, now->head, cache) {
                 list_del(&cache_entry->cache);
                 kfree(cache_entry);
-            } 
+            }
 
             // release
             free_cache_list(now->head);
@@ -992,5 +1019,6 @@ static int remove_key_from_hashtable(void *hash_cnt){
         }
     }
     rcu_read_unlock();
+    return 1;
 }
 // ==============================================================
